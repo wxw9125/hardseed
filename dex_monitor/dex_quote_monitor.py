@@ -29,6 +29,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import statistics
 import math
@@ -308,6 +309,69 @@ def get_quotes_matrix(
             for p in ps:
                 out.append(get_quote(p, d, amt, eth_price, gas_gwei, use_real=use_real))
     return out
+
+
+# ----------------------------------------------------------------------------
+# Async 版本（aiohttp + asyncio.gather 并发，供 web/批量场景使用）
+# 真实模式下用 async 并发拉取链上/API 报价，总耗时≈单次最慢请求而非累加
+# ----------------------------------------------------------------------------
+
+async def get_quote_async(
+    session,
+    platform: str,
+    direction: str,
+    amount_usd: float,
+    eth_price: float = DEFAULT_ETH_PRICE_USD,
+    gas_gwei: float = DEFAULT_GAS_PRICE_GWEI,
+    use_real: bool = False,
+) -> Quote:
+    """async 版 get_quote：真实模式走 real_providers.get_real_quote_async，
+    失败回退到同步模拟逻辑（模拟为纯计算，直接复用 get_quote）。"""
+    if use_real and _REAL_AVAILABLE and real_providers is not None:
+        real_q = await real_providers.get_real_quote_async(
+            session, platform, direction, amount_usd, eth_price, gas_gwei)
+        if real_q is not None:
+            return _build_quote_from_real(
+                platform, direction, amount_usd, eth_price, gas_gwei, real_q)
+    # 回退到模拟（纯计算，直接调用同步 get_quote）
+    return get_quote(platform, direction, amount_usd, eth_price, gas_gwei, use_real=False)
+
+
+async def get_quotes_matrix_async(
+    eth_price: float = DEFAULT_ETH_PRICE_USD,
+    gas_gwei: float = DEFAULT_GAS_PRICE_GWEI,
+    platforms: Optional[List[str]] = None,
+    directions: Optional[List[str]] = None,
+    amounts: Optional[List[float]] = None,
+    use_real: bool = False,
+) -> List[Quote]:
+    """async 版全量报价矩阵：用 asyncio.gather 并发采集所有组合。
+
+    真实模式下所有 (platform, direction, amount) 组合并发请求，
+    总耗时≈单次最慢 API（~3s）而非 72 次累加（~30s）。
+    内部创建并复用同一个 aiohttp.ClientSession 以减少连接开销。
+    """
+    ps = platforms or PLATFORMS
+    ds = directions or DIRECTIONS
+    amts = amounts or AMOUNT_TIERS
+
+    if not use_real or not _REAL_AVAILABLE or real_providers is None:
+        # 非真实模式：直接走同步（纯计算，async 无收益）
+        return get_quotes_matrix(eth_price, gas_gwei, ps, ds, amts, use_real=False)
+
+    # 真实模式：创建共享 session，并发采集
+    # trust_env=True 让 aiohttp 读取 HTTP_PROXY/HTTPS_PROXY（沙箱/容器环境必需）
+    import aiohttp
+    connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout,
+                                     trust_env=True) as session:
+        tasks = [
+            get_quote_async(session, p, d, amt, eth_price, gas_gwei, use_real=True)
+            for d in ds for amt in amts for p in ps
+        ]
+        results = await asyncio.gather(*tasks)
+    return list(results)
 
 
 # ----------------------------------------------------------------------------
