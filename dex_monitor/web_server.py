@@ -37,6 +37,9 @@ import dex_quote_monitor as monitor  # noqa: E402
 
 STATIC_DIR = os.path.join(HERE, "static")
 
+# 服务器默认是否启用真实报价模式（可用 --real 在启动时打开）
+SERVER_DEFAULT_REAL = False
+
 
 # ----------------------------------------------------------------------------
 # 关键词解析
@@ -118,22 +121,47 @@ def parse_keywords(kw: str):
     }
 
 
-def run_query(kw: str):
-    """执行报价采集并返回结构化结果（dict）。"""
+def run_query(kw: str, use_real: bool = False):
+    """
+    执行报价采集并返回结构化结果（dict）。
+    use_real=True 时优先调用真实 API（CowSwap/ParaSwap/Uniswap 池子 slot0）；
+    真实模式还会自动从链上获取 ETH 中价（覆盖关键词中的 price=）。
+    """
     parsed = parse_keywords(kw)
+    eth_price = parsed["eth_price"]
+    gas_gwei = parsed["gas_gwei"]
+    data_source = "simulated_quote (基于协议真实参数模型)"
+    real_status = None
+
+    if use_real and monitor._REAL_AVAILABLE and monitor.real_providers is not None:
+        # 先做健康检查（uniswap_quote 在其中读取 slot0 会顺便预热中价缓存）
+        try:
+            real_status = monitor.real_providers.health_check()
+        except Exception as e:
+            real_status = {"_error": str(e)}
+        # 自动从链上获取 ETH 中价（覆盖默认/关键词中的 price=）
+        # 健康检查已预热缓存，此处优先用实时值，失败则用 60s 内缓存
+        mp = monitor.real_providers.get_eth_usd_midprice()
+        if mp and mp > 0:
+            eth_price = mp
+        data_source = "real_api (CowSwap/ParaSwap/Uniswap slot0) + 模拟回退"
+
     quotes = monitor.get_quotes_matrix(
-        eth_price=parsed["eth_price"],
-        gas_gwei=parsed["gas_gwei"],
+        eth_price=eth_price,
+        gas_gwei=gas_gwei,
         platforms=parsed["platforms"],
         directions=parsed["directions"],
         amounts=parsed["amounts"],
+        use_real=use_real,
     )
     analysis = monitor.analyze(quotes)
     return {
         "snapshot_time": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
-        "eth_price": parsed["eth_price"],
-        "gas_gwei": parsed["gas_gwei"],
-        "data_source": "simulated_quote (基于协议真实参数模型)",
+        "eth_price": eth_price,
+        "gas_gwei": gas_gwei,
+        "use_real": bool(use_real and monitor._REAL_AVAILABLE),
+        "data_source": data_source,
+        "real_providers_status": real_status,
         "parsed_keywords": parsed,
         "platforms": parsed["platforms"] or monitor.PLATFORMS,
         "directions": parsed["directions"] or monitor.DIRECTIONS,
@@ -283,10 +311,31 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/metrics":
             self._send_json(METRICS_DOC)
             return
+        if path == "/api/health":
+            # 真实提供者健康检查 + ETH 中价
+            if not (monitor._REAL_AVAILABLE and monitor.real_providers is not None):
+                self._send_json({
+                    "real_available": False,
+                    "message": "real_providers 模块未加载",
+                })
+                return
+            try:
+                status = monitor.real_providers.health_check()
+                mp = monitor.real_providers.get_eth_usd_midprice()
+                self._send_json({
+                    "real_available": True,
+                    "providers": status,
+                    "eth_usd_midprice": mp,
+                })
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=500)
+            return
         if path in ("/api/quotes", "/api/run-script"):
             kw = (qs.get("kw", [""])[0] or "").strip()
+            # real=1 启用真实 API 报价（GET 参数优先于服务器默认）
+            real_flag = SERVER_DEFAULT_REAL or (qs.get("real", ["0"])[0] in ("1", "true", "yes"))
             try:
-                result = run_query(kw)
+                result = run_query(kw, use_real=real_flag)
                 self._send_json(result)
             except Exception as e:
                 self._send_json({"error": str(e), "keyword": kw}, status=400)
@@ -306,22 +355,29 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="ETH/USDT DEX 报价监控 Web 服务器")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0")
     parser.add_argument("--port", type=int, default=8080, help="监听端口，默认 8080")
+    parser.add_argument("--real", action="store_true",
+                        help="启动即默认启用真实 API 报价（仍可被 ?real=0 覆盖；默认未开启时可用 ?real=1 临时启用）")
     args = parser.parse_args(argv)
 
-    # 启动前预热示例数据
-    global EXAMPLE_RESULT
-    EXAMPLE_RESULT = run_query(EXAMPLE_KEYWORD)
+    global SERVER_DEFAULT_REAL, EXAMPLE_RESULT
+    SERVER_DEFAULT_REAL = bool(args.real)
+
+    # 启动前预热示例数据（按 --real 决定数据源）
+    EXAMPLE_RESULT = run_query(EXAMPLE_KEYWORD, use_real=SERVER_DEFAULT_REAL)
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"[web] ETH/USDT DEX 报价监控服务已启动")
+    real_tag = " [REAL 已启用]" if SERVER_DEFAULT_REAL else " [模拟模式，?real=1 可临时启用真实]"
+    print(f"[web] ETH/USDT DEX 报价监控服务已启动{real_tag}")
     print(f"[web] 监听: http://{args.host}:{args.port}")
+    print(f"[web] real_providers 可用: {monitor._REAL_AVAILABLE}")
     print(f"[web] 示例关键词: {EXAMPLE_KEYWORD}")
     print(f"[web] 端点:")
     print(f"[web]   GET /                  -> 首页")
     print(f"[web]   GET /api/example       -> 初始化示例数据")
     print(f"[web]   GET /api/metrics       -> 监控指标/告警规则")
-    print(f"[web]   GET /api/quotes?kw=...  -> 现场运行（关键词采集）")
-    print(f"[web]   GET /api/run-script?kw=... -> 同上（语义化别名）")
+    print(f"[web]   GET /api/health        -> 真实提供者健康检查 + ETH 中价")
+    print(f"[web]   GET /api/quotes?kw=... &real=1  -> 现场运行（关键词采集）")
+    print(f"[web]   GET /api/run-script?kw=...     -> 同上（语义化别名）")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

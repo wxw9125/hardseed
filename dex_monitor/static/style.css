@@ -36,9 +36,10 @@ code { background: #161b22; padding: 1px 6px; border-radius: 4px; color: #f0c674
 .brand h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: .3px; }
 .brand .sub { margin: 2px 0 0; font-size: 12px; color: #8b949e; }
 .status { display: flex; gap: 22px; flex-wrap: wrap; }
-.status > div { display: flex; flex-direction: column; align-items: flex-end; }
+.status > div { display: flex; flex-direction: column; align-items: flex-end; min-width: 0; }
+.status > div.span-2 { flex: 1 1 100%; align-items: flex-end; }
 .status .k { font-size: 11px; color: #6e7681; text-transform: uppercase; letter-spacing: .5px; }
-.status .v { font-size: 13px; color: #e6edf3; font-weight: 600; }
+.status .v { font-size: 13px; color: #e6edf3; font-weight: 600; word-break: break-all; text-align: right; }
 
 /* ---------- Runner ---------- */
 .runner {
@@ -74,8 +75,11 @@ code { background: #161b22; padding: 1px 6px; border-radius: 4px; color: #f0c674
 .btn-primary { background: #238636; color: #fff; border-color: #2ea043; }
 .btn-primary:hover { background: #2ea043; }
 .btn-primary:active { transform: translateY(1px); }
+.btn-primary:disabled { opacity: .6; cursor: not-allowed; }
 .btn-ghost { background: #161b22; color: #c9d1d9; border-color: #30363d; }
 .btn-ghost:hover { background: #1f2630; }
+.btn-ghost.real-off { color: #8b949e; border-color: #30363d; }
+.btn-ghost.real-on  { color: #7ee787; border-color: #2ea043; background: #0d1f1a; box-shadow: 0 0 0 1px rgba(126,231,135,.2) inset; }
 
 .runner-help { margin-top: 8px; font-size: 12px; color: #8b949e; }
 .runner-help code { margin-right: 6px; }

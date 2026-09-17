@@ -10,6 +10,7 @@ const PLATFORM_COLORS = {
 const RANK_COLORS = ["#7ee787", "#a5d6ff", "#d2a8ff", "#f85149"];
 
 let charts = {};  // 保存所有 Chart 实例，便于 destroy 重建
+let realMode = false;  // 是否启用真实 API 报价（前端 toggle，与 ?real=1 同义）
 
 // ---------- helpers ----------
 function fmtUSD(v) {
@@ -43,6 +44,16 @@ function renderStatus(data) {
   document.getElementById("snap").textContent = (data.snapshot_time || "—").replace("T"," ").replace(/\..*Z?$/," UTC");
   document.getElementById("ethp").textContent = data.eth_price ? "$" + fmtNum(data.eth_price, 2) : "—";
   document.getElementById("gas").textContent  = data.gas_gwei ? fmtNum(data.gas_gwei, 1) + " gwei" : "—";
+  // 真实提供者健康状态
+  const el = document.getElementById("providers");
+  if (el) {
+    const st = data.real_providers_status;
+    if (!st || st._error) {
+      el.textContent = st && st._error ? ("健康检查失败：" + st._error) : "—";
+    } else {
+      el.textContent = Object.entries(st).map(([k,v]) => `${k}=${v}`).join(" · ");
+    }
+  }
 }
 
 // ---------- 关键词解析结果展示 ----------
@@ -473,12 +484,20 @@ async function runScript(kw) {
   runBtn.disabled = true;
   runBtn.textContent = "运行中...";
   try {
-    const url = "/api/quotes?kw=" + encodeURIComponent(kw || "");
+    const params = new URLSearchParams();
+    if (kw) params.set("kw", kw);
+    if (realMode) params.set("real", "1");
+    const url = "/api/quotes?" + params.toString();
     const resp = await fetch(url);
     const data = await resp.json();
     if (!resp.ok || data.error) {
       alert("运行失败：" + (data.error || resp.statusText));
       return;
+    }
+    // 服务器返回的真实模式状态回填前端 toggle
+    if (typeof data.use_real === "boolean") {
+      realMode = data.use_real;
+      syncRealToggle();
     }
     renderAll(data);
   } catch (e) {
@@ -486,6 +505,48 @@ async function runScript(kw) {
   } finally {
     runBtn.disabled = false;
     runBtn.textContent = originalText;
+  }
+}
+
+// ---------- 真实模式 toggle ----------
+function syncRealToggle() {
+  const btn = document.getElementById("toggle-real");
+  if (!btn) return;
+  if (realMode) {
+    btn.textContent = "真实 API: ON";
+    btn.classList.add("real-on");
+    btn.classList.remove("real-off");
+  } else {
+    btn.textContent = "真实 API: OFF";
+    btn.classList.add("real-off");
+    btn.classList.remove("real-on");
+  }
+}
+async function toggleReal() {
+  realMode = !realMode;
+  syncRealToggle();
+  // 切换后立即刷新一次
+  await runScript(document.getElementById("kw").value);
+}
+
+// ---------- 健康检查（独立按钮） ----------
+async function loadHealth() {
+  const el = document.getElementById("providers");
+  if (el) el.textContent = "健康检查中...";
+  try {
+    const resp = await fetch("/api/health");
+    const data = await resp.json();
+    if (data.error) { alert("健康检查失败：" + data.error); return; }
+    if (!data.real_available) {
+      alert("real_providers 模块未加载");
+      return;
+    }
+    const lines = Object.entries(data.providers || {}).map(([k,v]) => `${k}=${v}`);
+    const mp = data.eth_usd_midprice ? ` | ETH 中价=$${fmtNum(data.eth_usd_midprice,2)}` : "";
+    alert("真实提供者健康检查：\n" + lines.join("\n") + mp);
+    if (el) el.textContent = lines.join(" · ") + mp;
+  } catch (e) {
+    alert("健康检查失败：" + e.message);
   }
 }
 
@@ -504,9 +565,15 @@ async function loadExample() {
 
 // ---------- 启动 ----------
 document.addEventListener("DOMContentLoaded", () => {
+  // 初始化真实模式 toggle 视觉状态
+  syncRealToggle();
   document.getElementById("run").addEventListener("click", () => {
     runScript(document.getElementById("kw").value);
   });
+  const toggleBtn = document.getElementById("toggle-real");
+  if (toggleBtn) toggleBtn.addEventListener("click", toggleReal);
+  const healthBtn = document.getElementById("health");
+  if (healthBtn) healthBtn.addEventListener("click", loadHealth);
   document.getElementById("example").addEventListener("click", loadExample);
   document.getElementById("metrics").addEventListener("click", loadMetrics);
   document.getElementById("kw").addEventListener("keydown", e => {

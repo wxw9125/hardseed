@@ -36,6 +36,14 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 
+# 真实 API 提供者（可选导入，失败时回退到模拟模式）
+try:
+    import real_providers
+    _REAL_AVAILABLE = True
+except Exception:
+    _REAL_AVAILABLE = False
+    real_providers = None
+
 
 # ----------------------------------------------------------------------------
 # 全局常量 / 默认参数
@@ -155,20 +163,75 @@ def gas_cost_usd(gas_units: int, gas_gwei: float, eth_price: float) -> float:
     return gas_units * gas_gwei * 1e-9 * eth_price
 
 
+def _build_quote_from_real(
+    platform: str,
+    direction: str,
+    amount_usd: float,
+    eth_price: float,
+    gas_gwei: float,
+    real_q: dict,
+) -> Quote:
+    """从 real_providers 返回的 dict 组装 Quote 对象。"""
+    p = DEX_PROFILES[platform]
+    gross_out_usd = real_q["gross_out_usd"]
+    gas_units = real_q.get("gas_units", p["gas_units"])
+    g_cost = gas_cost_usd(gas_units, gas_gwei, eth_price)
+    net_received = gross_out_usd - g_cost
+    exec_price = real_q["exec_price"]
+    impact_bps = real_q.get("price_impact_bps", 0)
+    fee_bps = real_q.get("fee_bps", p["fee_bps"])
+    effective_spread_bps = fee_bps + impact_bps
+    notes = real_q.get("notes", "")
+    data_source = real_q.get("data_source", "real_api")
+
+    if direction == "ETH->USDT":
+        base_price = eth_price
+        notes_full = notes + f" | 输入 {amount_usd/eth_price:.6f} ETH → 输出 {gross_out_usd:.2f} USDT"
+    else:
+        base_price = 1.0 / eth_price
+        notes_full = notes + f" | 输入 {amount_usd:.2f} USDT → 输出 {gross_out_usd/eth_price:.6f} ETH"
+
+    return Quote(
+        platform=platform,
+        direction=direction,
+        amount_usd=amount_usd,
+        base_price=base_price,
+        exec_price=exec_price,
+        gross_out_usd=gross_out_usd,
+        gas_cost_usd=g_cost,
+        net_received_usd=net_received,
+        price_impact_bps=impact_bps,
+        fee_bps=fee_bps,
+        effective_spread_bps=effective_spread_bps,
+        gas_units=gas_units,
+        routing_complexity=real_q.get("routing_complexity", p["routing_complexity"]),
+        mev_risk=p["mev_risk"],
+        notes=notes_full,
+    )
+
+
 def get_quote(
     platform: str,
     direction: str,
     amount_usd: float,
     eth_price: float = DEFAULT_ETH_PRICE_USD,
     gas_gwei: float = DEFAULT_GAS_PRICE_GWEI,
+    use_real: bool = False,
 ) -> Quote:
     """
     获取单个平台在指定方向、金额下的报价。
     返回 Quote 对象，含可执行价格、毛到手、净到手、gas、价格影响等字段。
 
-    注：当前为基于协议参数的模拟报价。真实接入时替换此函数内部实现即可，
-        分析层 get_quotes_matrix / analyze / report 无需改动。
+    use_real=True 时优先调用真实 API (CowSwap/ParaSwap/Uniswap 池子)；
+    失败自动回退到模拟模型。
     """
+    # 真实报价模式：优先调用 real_providers
+    if use_real and _REAL_AVAILABLE and real_providers is not None:
+        real_q = real_providers.get_real_quote(platform, direction, amount_usd, eth_price, gas_gwei)
+        if real_q is not None:
+            return _build_quote_from_real(platform, direction, amount_usd, eth_price, gas_gwei, real_q)
+
+    # 模拟报价（默认/回退）
     p = DEX_PROFILES[platform]
     impact = price_impact(amount_usd, p["liquidity_usd"])
     impact_bps = impact * 10000
@@ -233,6 +296,7 @@ def get_quotes_matrix(
     platforms: Optional[List[str]] = None,
     directions: Optional[List[str]] = None,
     amounts: Optional[List[float]] = None,
+    use_real: bool = False,
 ) -> List[Quote]:
     """采集全量报价矩阵：所有 (platform, direction, amount) 组合。"""
     ps = platforms or PLATFORMS
@@ -242,7 +306,7 @@ def get_quotes_matrix(
     for d in ds:
         for amt in amts:
             for p in ps:
-                out.append(get_quote(p, d, amt, eth_price, gas_gwei))
+                out.append(get_quote(p, d, amt, eth_price, gas_gwei, use_real=use_real))
     return out
 
 
@@ -752,6 +816,7 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--platform", choices=PLATFORMS, action="append", help="只看某些平台（可多次）")
     parser.add_argument("--eth-price", type=float, default=DEFAULT_ETH_PRICE_USD, help="ETH 中价 USD")
     parser.add_argument("--gas-gwei", type=float, default=DEFAULT_GAS_PRICE_GWEI, help="Gas 价格 gwei")
+    parser.add_argument("--real", action="store_true", help="启用真实 API 报价 (CowSwap/ParaSwap/Uniswap 链上)")
     args = parser.parse_args(argv)
 
     # 默认行为：无 flag 时输出 report
@@ -762,21 +827,36 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     directions = [args.direction] if args.direction else DIRECTIONS
     platforms = args.platform or PLATFORMS
 
+    # 真实模式：自动从链上获取 ETH 中价（除非用户显式指定）
+    eth_price = args.eth_price
+    data_source_label = "simulated_quote (基于协议真实参数模型)"
+    if args.real:
+        if _REAL_AVAILABLE and real_providers is not None:
+            # 尝试从链上获取 ETH 中价
+            mp = real_providers.get_eth_usd_midprice()
+            if mp and abs(mp - DEFAULT_ETH_PRICE_USD) > 1:
+                eth_price = mp
+            data_source_label = "real_api (CowSwap solver + ParaSwap + Uniswap V3 pool slot0; Tokenlon 估算)"
+        else:
+            print("[警告] real_providers 模块不可用，回退到模拟模式")
+
     quotes = get_quotes_matrix(
-        eth_price=args.eth_price,
+        eth_price=eth_price,
         gas_gwei=args.gas_gwei,
         platforms=platforms,
         directions=directions,
         amounts=amounts,
+        use_real=args.real,
     )
     analysis = analyze(quotes)
 
     if args.json:
         payload = {
             "snapshot_time": datetime.now(timezone.utc).isoformat(),
-            "eth_price": args.eth_price,
+            "eth_price": eth_price,
             "gas_gwei": args.gas_gwei,
-            "data_source": "simulated_quote (基于协议真实参数模型)",
+            "data_source": data_source_label,
+            "real_mode": args.real,
             "platforms": platforms,
             "directions": directions,
             "amount_tiers": amounts,
@@ -785,7 +865,7 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(build_report(quotes, analysis, args.eth_price, args.gas_gwei))
+        print(build_report(quotes, analysis, eth_price, args.gas_gwei))
     return 0
 
 
