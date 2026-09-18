@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ETH/USDT DEX 报价监控 · 演示</title>
+<link rel="stylesheet" href="/static/style.css?v=2" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⬢</span>
+    <div>
+      <h1>ETH/USDT DEX 报价监控与分析</h1>
+      <p class="sub">Tokenlon · Uniswap · 1inch · CowSwap ｜ 以太坊主网双向报价竞争力</p>
+    </div>
+  </div>
+  <div class="status">
+    <div><span class="k">数据来源</span><span class="v" id="ds">—</span></div>
+    <div><span class="k">快照时间</span><span class="v" id="snap">—</span></div>
+    <div><span class="k">ETH 中价</span><span class="v" id="ethp">—</span></div>
+    <div><span class="k">Gas</span><span class="v" id="gas">—</span></div>
+    <div class="span-2"><span class="k">真实提供者</span><span class="v" id="providers">—</span></div>
+  </div>
+</header>
+
+<section class="runner">
+  <div class="runner-row">
+    <input id="kw" type="text" placeholder="输入关键词现场运行：例如  50000 ETH->USDT Uniswap 1inch  |  1M USDT->ETH CowSwap  |  price=3000 gas=30" />
+    <button id="run" class="btn-primary">现场运行</button>
+    <button id="toggle-real" class="btn-ghost real-off" type="button">真实 API: OFF</button>
+    <button id="health" class="btn-ghost" type="button">健康检查</button>
+    <button id="example" class="btn-ghost">加载示例</button>
+    <button id="metrics" class="btn-ghost">监控指标/告警</button>
+  </div>
+  <div class="runner-help">
+    关键词语法（空格分隔，不区分大小写）：
+    <code>Uniswap</code> <code>1inch</code> <code>CowSwap</code> <code>Tokenlon</code> 选平台；
+    <code>ETH-&gt;USDT</code> <code>USDT-&gt;ETH</code> 选方向；
+    <code>50000</code> / <code>50K</code> / <code>1M</code> 选金额；
+    <code>price=3000</code> <code>gas=30</code> 调基准。
+    开启<strong>真实 API</strong> 后将从 CowSwap/ParaSwap/Uniswap 池子 slot0 获取链上真实报价（自动覆盖 price=）。
+  </div>
+  <div id="parse-info" class="parse-info hidden"></div>
+</section>
+
+<section class="grid">
+  <div class="card span-3">
+    <div class="card-head">
+      <h2>最优报价频率（整体）</h2>
+      <span class="hint">周期内各平台成为最优的占比</span>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-freq"></canvas></div>
+  </div>
+  <div class="card">
+    <div class="card-head">
+      <h2>排名分布</h2>
+      <span class="hint">每个名次的次数</span>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-rank"></canvas></div>
+  </div>
+</section>
+
+<section class="grid">
+  <div class="card span-2">
+    <div class="card-head">
+      <h2>排名热力图</h2>
+      <span class="hint">每格=该金额区间下平台的名次（1 最优，颜色越绿越优）</span>
+    </div>
+    <div id="heatmap"></div>
+  </div>
+  <div class="card">
+    <div class="card-head">
+      <h2>价差随金额变化</h2>
+      <span class="hint">各平台相对最优的净到手差距 bps（log 横轴）</span>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-spread"></canvas></div>
+  </div>
+</section>
+
+<section class="grid">
+  <div class="card span-2">
+    <div class="card-head">
+      <h2>双向报价对比</h2>
+      <span class="hint">ETH→USDT 与 USDT→ETH 各平台净到手（同一金额并排）</span>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-dual"></canvas></div>
+  </div>
+  <div class="card">
+    <div class="card-head">
+      <h2>gas 占比 vs 金额</h2>
+      <span class="hint">gas/净到手 %，看小额区间稀释</span>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-gas"></canvas></div>
+  </div>
+</section>
+
+<section class="grid">
+  <div class="card span-3">
+    <div class="card-head">
+      <h2>报价主表</h2>
+      <span class="hint">按方向 + 金额分组，按净到手 USD 排序</span>
+    </div>
+    <div class="table-wrap">
+      <table id="main-table">
+        <thead>
+          <tr>
+            <th>方向</th>
+            <th>金额(USD)</th>
+            <th>平台</th>
+            <th>排名</th>
+            <th>净到手 USD</th>
+            <th>可执行价</th>
+            <th>价差 vs 最优</th>
+            <th>有效价差 bps</th>
+            <th>价格影响 bps</th>
+            <th>gas USD</th>
+            <th>路由</th>
+            <th>MEV</th>
+            <th>备注</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="grid">
+  <div class="card span-3">
+    <div class="card-head">
+      <h2>聚合器 vs 单 DEX / CowSwap vs 即时报价</h2>
+      <span class="hint">1inch、CowSwap 相对 Uniswap；CowSwap 批量拍卖 vs 其他即时报价</span>
+    </div>
+    <div class="table-wrap">
+      <table id="diff-table">
+        <thead>
+          <tr>
+            <th>方向</th><th>金额(USD)</th><th>对比</th><th>差异 bps</th><th>说明</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="grid">
+  <div class="card span-3">
+    <div class="card-head">
+      <h2>结论与套利/路由优化机会</h2>
+      <span class="hint">基于本次快照自动生成</span>
+    </div>
+    <ol id="conclusions"></ol>
+  </div>
+</section>
+
+<section class="grid hidden" id="metrics-section">
+  <div class="card">
+    <div class="card-head"><h2>监控指标定义</h2></div>
+    <div class="table-wrap">
+      <table id="metrics-table">
+        <thead><tr><th>Key</th><th>名称</th><th>定义</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h2>采集频率建议</h2></div>
+    <ul id="freq-list" class="bullet"></ul>
+  </div>
+  <div class="card">
+    <div class="card-head"><h2>告警规则</h2></div>
+    <div class="table-wrap">
+      <table id="alert-table">
+        <thead><tr><th>规则</th><th>动作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="card span-3">
+    <div class="card-head"><h2>图表建议</h2></div>
+    <ul id="chart-sugg" class="bullet"></ul>
+  </div>
+</section>
+
+<footer class="foot">
+  <p>ETH/USDT DEX 报价监控演示 · 默认模拟报价模型；开启<strong>真实 API</strong> 后接入 CowSwap/ParaSwap/Uniswap V3 池子 slot0 真实链上数据；Tokenlon 因无公开 API 仍走估算模型</p>
+</footer>
+
+<script src="/static/app.js?v=2"></script>
+</body>
+</html>
