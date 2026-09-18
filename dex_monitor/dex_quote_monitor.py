@@ -374,9 +374,38 @@ async def get_quotes_matrix_async(
     return list(results)
 
 
-# ----------------------------------------------------------------------------
-# 分析层
-# ----------------------------------------------------------------------------
+def get_quotes_matrix_threaded(
+    eth_price: float = DEFAULT_ETH_PRICE_USD,
+    gas_gwei: float = DEFAULT_GAS_PRICE_GWEI,
+    platforms: Optional[List[str]] = None,
+    directions: Optional[List[str]] = None,
+    amounts: Optional[List[float]] = None,
+    use_real: bool = False,
+    max_workers: int = 20,
+) -> List[Quote]:
+    """ThreadPoolExecutor 并发版全量报价矩阵。
+
+    与 async 版功能等价，但不依赖 asyncio/aiohttp，适合在 ThreadingHTTPServer
+    的子线程中直接调用（避免预览网关对 asyncio 的兼容性问题）。
+    真实模式下每个 (platform, direction, amount) 组合在独立线程中并发调用
+    同步 get_quote(use_real=True)，总耗时≈单次最慢 RPC/API（~5s）而非累加（~30s+）。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    ps = platforms or PLATFORMS
+    ds = directions or DIRECTIONS
+    amts = amounts or AMOUNT_TIERS
+
+    if not use_real or not _REAL_AVAILABLE or real_providers is None:
+        return get_quotes_matrix(eth_price, gas_gwei, ps, ds, amts, use_real=False)
+
+    combos = [(p, d, amt) for d in ds for amt in amts for p in ps]
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(combos))) as pool:
+        results = list(pool.map(
+            lambda args: get_quote(args[0], args[1], args[2], eth_price, gas_gwei, use_real=True),
+            combos,
+        ))
+    return results
 
 @dataclass
 class GroupStat:

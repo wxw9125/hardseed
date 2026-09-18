@@ -484,11 +484,12 @@ async function runScript(kw) {
   runBtn.disabled = true;
   runBtn.textContent = "运行中...";
   try {
-    const params = new URLSearchParams();
-    if (kw) params.set("kw", kw);
-    if (realMode) params.set("real", "1");
-    const url = "/api/quotes?" + params.toString();
-    const resp = await fetch(url);
+    // 用 POST 避免预览网关对 GET 查询参数的 "failed to build request" 问题
+    const resp = await fetch("/api/quotes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kw: kw || "", real: realMode }),
+    });
     const data = await resp.json();
     if (!resp.ok || data.error) {
       alert("运行失败：" + (data.error || resp.statusText));

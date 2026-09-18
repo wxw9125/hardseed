@@ -132,7 +132,7 @@ def run_query(kw: str, use_real: bool = False):
     执行报价采集并返回结构化结果（dict）。
     use_real=True 时优先调用真实 API（CowSwap/ParaSwap/Uniswap 池子 slot0）；
     真实模式还会自动从链上获取 ETH 中价（覆盖关键词中的 price=）。
-    真实模式走 async 并发路径（aiohttp + asyncio.gather），总耗时≈单次最慢 API。
+    真实模式走 ThreadPoolExecutor 并发路径（不用 asyncio，兼容预览网关）。
     """
     parsed = parse_keywords(kw)
     eth_price = parsed["eth_price"]
@@ -142,18 +142,19 @@ def run_query(kw: str, use_real: bool = False):
 
     real_active = bool(use_real and monitor._REAL_AVAILABLE and monitor.real_providers is not None)
     if real_active:
-        # 真实模式：用 async 并发执行健康检查 + ETH 中价 + 全量报价矩阵
-        try:
-            eth_price, real_status, quotes = asyncio.run(_run_real_async(parsed, eth_price))
-        except Exception as e:
-            # async 路径整体失败 -> 回退到同步模拟
-            real_status = {"_error": f"async 失败: {e}"}
-            quotes = monitor.get_quotes_matrix(
-                eth_price=eth_price, gas_gwei=gas_gwei,
-                platforms=parsed["platforms"], directions=parsed["directions"],
-                amounts=parsed["amounts"], use_real=False,
-            )
-        data_source = "real_api (CowSwap/ParaSwap/Uniswap slot0, async 并发) + 模拟回退"
+        # 真实模式：从链上获取 ETH 中价（优先用 5 分钟缓存，缓存未命中才实时拉取）
+        mp = monitor.real_providers.get_eth_usd_midprice()
+        if mp and mp > 0:
+            eth_price = mp
+        # 健康状态由前端单独调 /api/health 获取，这里不做 health_check 以减少延迟
+        real_status = None
+        # 并发采集全量报价矩阵（ThreadPoolExecutor，不依赖 asyncio）
+        quotes = monitor.get_quotes_matrix_threaded(
+            eth_price=eth_price, gas_gwei=gas_gwei,
+            platforms=parsed["platforms"], directions=parsed["directions"],
+            amounts=parsed["amounts"], use_real=True,
+        )
+        data_source = "real_api (CowSwap/ParaSwap/Uniswap slot0, 线程池并发) + 模拟回退"
     else:
         quotes = monitor.get_quotes_matrix(
             eth_price=eth_price, gas_gwei=gas_gwei,
@@ -178,47 +179,11 @@ def run_query(kw: str, use_real: bool = False):
     }
 
 
-async def _run_real_async(parsed, eth_price):
-    """真实模式 async 编排：并发跑健康检查 + ETH 中价，再并发采集报价矩阵。
-    返回 (eth_price, real_status, quotes)。"""
-    # trust_env=True 让 aiohttp 读取 HTTP_PROXY/HTTPS_PROXY（沙箱/容器环境必需）
-    import aiohttp
+def _health_sync():
+    """同步健康检查 + ETH 中价。返回 (status, midprice)。"""
     rp = monitor.real_providers
-    connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
-    timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout,
-                                     trust_env=True) as session:
-        # 并发：健康检查 + ETH 中价（健康检查中 uniswap_quote_async 会预热中价缓存）
-        health_task = asyncio.create_task(rp.health_check_async(session))
-        midprice_task = asyncio.create_task(rp.get_eth_usd_midprice_async(session))
-        real_status, mp = await asyncio.gather(health_task, midprice_task)
-        if mp and mp > 0:
-            eth_price = mp
-        # 并发采集全量报价矩阵
-        quotes = await monitor.get_quotes_matrix_async(
-            eth_price=eth_price,
-            gas_gwei=parsed["gas_gwei"],
-            platforms=parsed["platforms"],
-            directions=parsed["directions"],
-            amounts=parsed["amounts"],
-            use_real=True,
-        )
-    return eth_price, real_status, quotes
-
-
-async def _health_async():
-    """async 健康检查 + ETH 中价，并发执行。返回 (status, midprice)。"""
-    # trust_env=True 让 aiohttp 读取 HTTP_PROXY/HTTPS_PROXY（沙箱/容器环境必需）
-    import aiohttp
-    rp = monitor.real_providers
-    connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
-    timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout,
-                                     trust_env=True) as session:
-        status, mp = await asyncio.gather(
-            rp.health_check_async(session),
-            rp.get_eth_usd_midprice_async(session),
-        )
+    status = rp.health_check()
+    mp = rp.get_eth_usd_midprice()
     return status, mp
 
 
@@ -363,7 +328,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(METRICS_DOC)
             return
         if path == "/api/health":
-            # 真实提供者健康检查 + ETH 中价（async 并发，比同步快 3 倍以上）
+            # 真实提供者健康检查 + ETH 中价（同步，不依赖 asyncio）
             if not (monitor._REAL_AVAILABLE and monitor.real_providers is not None):
                 self._send_json({
                     "real_available": False,
@@ -371,7 +336,7 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
             try:
-                status, mp = asyncio.run(_health_async())
+                status, mp = _health_sync()
                 self._send_json({
                     "real_available": True,
                     "providers": status,
@@ -393,10 +358,27 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_text("404 Not Found", status=404)
 
+    def do_POST(self):
+        """POST 处理：/api/quotes 接收 JSON body {kw, real} 避免预览网关 GET 查询参数问题"""
+        path = urlparse(self.path).path
+        if path in ("/api/quotes", "/api/run-script"):
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                body = json.loads(raw) if raw else {}
+                kw = (body.get("kw") or "").strip()
+                use_real = bool(body.get("real"))
+                result = run_query(kw, use_real=use_real)
+                self._send_json(result)
+            except Exception as e:
+                self._send_json({"error": str(e), "keyword": kw if 'kw' in dir() else ""}, status=400)
+            return
+        self._send_text("404 Not Found", status=404)
+
     def do_OPTIONS(self):  # CORS 预检
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
