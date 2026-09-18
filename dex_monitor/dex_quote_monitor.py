@@ -232,6 +232,12 @@ def get_quote(
         if real_q is not None:
             return _build_quote_from_real(platform, direction, amount_usd, eth_price, gas_gwei, real_q)
 
+    # Tokenlon 无公开 API，始终走 v2 估算模型（模拟与真实模式一致）
+    if platform == "Tokenlon" and _REAL_AVAILABLE and real_providers is not None:
+        real_q = real_providers.tokenlon_quote(direction, amount_usd, eth_price, gas_gwei)
+        if real_q is not None:
+            return _build_quote_from_real(platform, direction, amount_usd, eth_price, gas_gwei, real_q)
+
     # 模拟报价（默认/回退）
     p = DEX_PROFILES[platform]
     impact = price_impact(amount_usd, p["liquidity_usd"])
