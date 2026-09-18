@@ -107,14 +107,14 @@ DEX_PROFILES: Dict[str, Dict] = {
         "description": "CowSwap 批量拍卖，solver 竞价含 MEV 防护，大单 surplus 明显",
     },
     "Tokenlon": {
-        "fee_bps": 10,               # RFQ 做市商价差约 10bps
-        "liquidity_usd": 100_000_000,# 做市商资金池总深度
+        "fee_bps": 30,               # 官方基础费率 0.30%（Level 0），非稳定币对
+        "liquidity_usd": 100_000_000,# 做市商 + AMM 聚合深度
         "gas_units": 200_000,
         "routing_complexity": 1,
         "mev_risk": "very_low",     # RFQ 链下撮合，无三明治风险
         "surplus_bps": 0,
-        "size_bonus": 1.2,           # 大单返点（机构量级折扣）
-        "description": "Tokenlon RFQ，专业做市商链下报价，大单返点，无 MEV",
+        "size_bonus": 2.0,           # 官方 10 档分级折扣（30→10bps@$10M≈20bps 折扣）
+        "description": "Tokenlon RFQ，官方费率 30bps 起，按 30 天量分级降至 10bps，无 MEV",
     },
 }
 

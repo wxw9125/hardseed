@@ -400,38 +400,97 @@ def paraswap_quote(direction: str, amount_usd: float, eth_price: float) -> Optio
 
 
 # ----------------------------------------------------------------------------
-# Tokenlon 模拟（无公开 API，保留模型）
+# Tokenlon 估算模型（基于官方费率表 + PMM 架构，无公开 API）
+# 数据来源：https://support.tokenlon.im/hc/en-us/articles/360037260272-Fees
 # ----------------------------------------------------------------------------
+
+# 官方费率档位（10 档），基于 30 天累计交易量 OR LON 持仓量取更优档
+# 此处以单笔金额作为 30 天量的代理（监控用途，展示不同规模用户的费率）
+_TOKENLON_FEE_TIERS = [
+    # (min_amount_usd, fee_bps, level)
+    (0,          30, 0),    # 0.30%
+    (30_000,     29, 1),    # 0.29%
+    (50_000,     28, 2),    # 0.28%
+    (100_000,    26, 3),    # 0.26%
+    (200_000,    24, 4),    # 0.24%
+    (500_000,    22, 5),    # 0.22%
+    (1_000_000,  20, 6),    # 0.20%
+    (2_000_000,  18, 7),    # 0.18%
+    (5_000_000,  15, 8),    # 0.15%
+    (10_000_000, 10, 9),    # 0.10%
+]
+
+
+def _tokenlon_fee_bps(amount_usd: float) -> tuple:
+    """根据金额映射到官方费率档位，返回 (fee_bps, level)"""
+    fee, level = 30, 0
+    for min_amt, bps, lv in _TOKENLON_FEE_TIERS:
+        if amount_usd >= min_amt:
+            fee, level = bps, lv
+    return fee, level
+
 
 def tokenlon_quote(direction: str, amount_usd: float, eth_price: float, gas_gwei: float) -> Optional[Dict]:
     """
-    Tokenlon 无公开 REST API，需 RFQ WebSocket 接入。
-    此处使用简化模型（基于做市商报价特征），标注为 estimated。
-    """
-    fee_bps = 10
-    size_bonus_bps = 1.2 * (amount_usd / 1_000_000)
-    net_fee_bps = max(0, fee_bps - size_bonus_bps)
-    net_factor = 1 - net_fee_bps / 10000
-    gross_out_usd = amount_usd * net_factor
+    Tokenlon RFQ 估算模型 v2（基于官方费率表 + PMM 架构）。
+    无公开 REST API，需 RFQ WebSocket 接入；此处按官方公开费率规则建模。
 
+    官方 Gas 规则（Scenario 2，Tokenlon 代付 gas）：
+      - ETH→Token：用户自付 gas，交易费全额收取
+      - Token→Token：trade_fee > gas → 实际费=trade_fee（gas 含在内）
+                      trade_fee < gas → 不收交易费，只扣 gas
+    """
+    import math
+
+    base_fee_bps, level = _tokenlon_fee_bps(amount_usd)
+    gas_units = 200_000
+    gas_cost_eth = gas_units * gas_gwei * 1e-9
+    gas_cost_usd = gas_cost_eth * eth_price
+    trade_fee_usd = amount_usd * base_fee_bps / 10000
+
+    if direction == "ETH->USDT":
+        # 卖 ETH：用户自付 gas（官方 Scenario 1），交易费全额收取
+        gross_out_usd = amount_usd - trade_fee_usd
+        effective_fee_bps = base_fee_bps
+        # gas_units 保持 200k，外层 net_received 会扣 gas
+    else:
+        # USDT->ETH：Tokenlon 代付 gas（官方 Scenario 2）
+        if trade_fee_usd >= gas_cost_usd:
+            # 交易费覆盖 gas：用户净成本 = 交易费，gas 不额外扣
+            gross_out_usd = amount_usd - trade_fee_usd
+            effective_fee_bps = base_fee_bps
+            gas_units = 0  # gas 已含在交易费内
+        else:
+            # gas > 交易费：不收交易费，只扣 gas 成本
+            gross_out_usd = amount_usd - gas_cost_usd
+            effective_fee_bps = gas_cost_usd / amount_usd * 10000 if amount_usd > 0 else 0
+            gas_units = 0  # gas 已在 gross_out 扣除
+
+    # RFQ 价格影响：做市商链下报价，小单几乎无影响
+    # 大单做市商需对冲，影响随金额平方根增长（比 AMM 线性温和）
+    # 参考：$1k≈2bps, $50k≈4.5bps, $1M≈20bps, $10M≈40bps(封顶)
+    impact_bps = min(40, 2.0 * math.sqrt(amount_usd / 10_000))
+    gross_out_usd *= (1 - impact_bps / 10000)
+
+    # 计算 exec_price
     if direction == "ETH->USDT":
         eth_in = amount_usd / eth_price
         exec_price = gross_out_usd / eth_in if eth_in > 0 else 0
         ref_price = eth_price
     else:
         eth_out = gross_out_usd / eth_price
-        exec_price = eth_out / amount_usd
+        exec_price = eth_out / amount_usd if amount_usd > 0 else 0
         ref_price = 1.0 / eth_price
 
     price_impact_bps = max(0, (ref_price - exec_price) / ref_price * 10000) if ref_price > 0 else 0
     return {
         "gross_out_usd": gross_out_usd,
-        "gas_units": 200000,
+        "gas_units": gas_units,
         "exec_price": exec_price,
         "price_impact_bps": price_impact_bps,
-        "fee_bps": net_fee_bps,
-        "notes": f"Tokenlon RFQ 估算（无公开 API，基于做市商模型）",
-        "data_source": "tokenlon_estimated_model",
+        "fee_bps": effective_fee_bps,
+        "notes": f"Tokenlon RFQ 估算（官方费率 L{level}={base_fee_bps}bps，无公开 API）",
+        "data_source": "tokenlon_estimated_model_v2",
     }
 
 
